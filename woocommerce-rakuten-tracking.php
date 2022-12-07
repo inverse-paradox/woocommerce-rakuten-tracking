@@ -20,6 +20,7 @@ class IP_Rakuten_Tracking {
 	protected $discountType;
 	protected $taxRate;
 	protected $removeTaxFromDiscount;
+	protected $scriptID;
 
 	public function __construct() {
 		// Add settings
@@ -32,12 +33,23 @@ class IP_Rakuten_Tracking {
 		$this->discountType = get_option( 'woocommerce_rakuten_discounttype', 'item' );
 		$this->taxRate = get_option( 'woocommerce_rakuten_taxrate', '20' );
 		$this->removeTaxFromDiscount = get_option( 'woocommerce_rakuten_removetaxfromdiscount', 'false' );
+		$this->scriptID = get_option( 'woocommerce_rakuten_scriptid', '' );
 
 		// Bail if no options have been set
-		if ( empty( $this->ranMID ) ) return;
+		if ( empty( $this->ranMID ) || empty( $this->scriptID ) ) return;
+
+		// Enqueue the global JS
+		wp_enqueue_script( 'rakuten-global-js-spi', plugin_dir_url( __FILE__ ) . 'rakuten-global-js-spi.js', [], '1.0.0', true );
+		wp_localize_script( 'rakuten-global-js-spi', 'ipRakuten', array(
+			'ranMID' => $this->ranMID,
+			'discountType' => $this->discountType,
+			'taxRate' => $this->taxRate,
+			'removeTaxFromDiscount' => $this->removeTaxFromDiscount,
+			'scriptID' => $this->scriptID,
+		) );
 
 		// Output the conversion script
-		add_action( 'woocommerce_thankyou', array( $this, 'output_script' ), 10, 1 );
+		add_action( 'woocommerce_thankyou', array( $this, 'datalayer' ), 10, 1 );
 	}
 
 	/**
@@ -110,6 +122,12 @@ class IP_Rakuten_Tracking {
                 'id'   => 'woocommerce_rakuten_removetaxfromdiscount',
 				'default' => 'false',
             ),
+			'scriptID' => array(
+				'name' => __( 'scriptID', 'woocommerce-rakuten-tracking' ),
+				'type' => 'text',
+				'desc_tip' => __( 'Enter the script ID from Rakuten, eg the numeric portion of //tag.rmp.rakuten.com/115827.ct.js would be 115827.' ),
+				'id' => 'woocommerce_rakuten_scriptid',
+			),
             'section_end' => array(
                  'type' => 'sectionend',
                  'id' => 'WooCommerce_Rakuten_Tracking_Settings_section_end'
@@ -122,48 +140,50 @@ class IP_Rakuten_Tracking {
 	/**
 	 * Output the conversion tracking script
 	 *
-	 * @param [type] $order_id
+	 * @param int  $order_id
 	 * @return void
 	 */
-	public function output_script( $order_id ) {
-
-		$ranMID = $this->ranMID;
-		$discountType = $this->discountType;
+	public function datalayer( $order_id ) {
+		// Set up access to variables
 		$taxRate = $this->taxRate;
 		$removeTaxFromDiscount = $this->removeTaxFromDiscount;
-		
+
+		// Check WC version
+		$woov3_7 = version_compare( WC()->version, '3.7', '>=' );
+
+		// Get the order
 		$order = wc_get_order( $order_id );
 
-		$currency = $order->get_currency(); 
-		$customerStatus = $order->get_user() ? 'Existing':'New'; 
-		$customerID = $order->get_customer_id(); 
-		$discountCode = implode('/',$order->get_coupon_codes());
-		$discountAmount = $order->get_discount_total();  
-		$taxAmount = $order->get_total_tax();
-	
-		// This is how to grab line items from the order 
+		// Display console error if order does not exist
+		if ( ! $order ) { 
+			?>
+			<script type="text/javascript">
+        		console.warn('Rakuten Advertising Conversion Tag Error: Order does not exist. Order not tracked.');
+        	</script>
+			<?php
+			return false;
+		}
+
+		// Bail if the order is failed
+		if ( $order->get_status() == 'failed' ) return false;
+
+		$order_number = $order->get_order_number();
+		$order_total = $order->get_total();
+		$order_subtotal = $order->get_subtotal();
+		$order_user_id = $order->get_user_id();
+		$order_cur = $order->get_currency();
+		$order_discount = $order->get_discount_total();
+		$order_discount_tax = $order->get_discount_tax();
+		$order_coupons = $woov3_7 ? implode( ',', $order->get_coupon_codes() ) : implode( ',', $order->get_used_coupons() );
+		$order_tax = $order->get_total_tax();
+
+		$order_count = wc_get_customer_order_count( $order_user_id );
+		$order_user_status = $order_count ? 'EXISTING' : 'NEW';
+
 		$line_items = $order->get_items();
 
-		echo "
-		<!-- START of Rakuten Marketing Conversion Tag -->
-		<script type=\"text/javascript\">
-		var rm_trans = {
-			affiliateConfig: {ranMID: '$ranMID', discountType: '$discountType', taxRate: $taxRate, removeTaxFromDiscount: $removeTaxFromDiscount},
-			
-			
-			orderid :'$order_id',
-			currency: '$currency',
-			customerStatus: '$customerStatus',
-			conversionType: 'Sale',
-			customerID: '$customerID',
-			discountCode: '$discountCode',
-			discountAmount: $discountAmount,
-			taxAmount: $taxAmount,
-		";
+		$items_array = [];
 
-		// Retrieve and format the line items
-		echo 'lineitems : [';
-		$data = array();
 		foreach ( $line_items as $item ) {
 			// Check to make sure the line item is a product
 			if ( is_callable( array( $item, 'get_product' ) ) ) {
@@ -172,30 +192,51 @@ class IP_Rakuten_Tracking {
 				continue;
 			}
 			
-			$qty = $item['qty']; // This is the qty purchased
-			$unitPrice = $order->get_item_subtotal( $item, true, true ); // The unit price is the line item subtotal
-			$unitPriceLessTax = $order->get_item_subtotal( $item ); // Price without tax
-			$sku = empty($product->get_sku()) ? $product->get_id() : $product->get_sku(); // This is the products SKU
-			$productName = addslashes($product->get_name()); // Add slashes for the product name
-			// Set up the data for each line item
-			$data[] = "
-			{
-				quantity : $qty,
-				unitPrice : $unitPrice,
-				unitPriceLessTax: $unitPriceLessTax,
-				SKU: '$sku',
-				productName: '$productName'
-			}
-			";
-		}
-		// Output the data as an array
-		echo implode(',',$data);
-		echo ']
-		};';
+			$sku = $product->get_sku(); // This is the product SKU
+            $name = $product->get_name(); // This is the product name
+            $qty = $item->get_quantity(); // This is the qty purchased
+            $price = $product->get_price(); // This is the product price
+            $item_total = $item->get_subtotal();
+            $item_total_tax = $item->get_subtotal_tax();
+            $item_total_disc = $item->get_total();
+            $item_total_tax_disc = $item->get_total_tax();
 
-		echo '/*Do not edit any information beneath this line*/
-		if(!window.DataLayer){window.DataLayer={Sale:{Basket:rm_trans}}}else{DataLayer.Sale=DataLayer.Sale||{Basket:rm_trans};DataLayer.Sale.Basket=DataLayer.Sale.Basket||rm_trans}DataLayer.Sale.Basket.Ready = true; function __readRMCookie(e){for(var a=e+"=",r=document.cookie.split(";"),t=0;t<r.length;t++){for(var n=r[t];" "==n.charAt(0);)n=n.substring(1,n.length);if(0==n.indexOf(a))return n.substring(a.length,n.length)}return""}function __readRMCookiev2(e,a){for(var r=__readRMCookie(a=a||"rmStore");r!==decodeURIComponent(r);)r=decodeURIComponent(r);for(var t=r.split("|"),n=0;n<t.length;n++){var i=t[n].split(":")[0],o=t[n].split(":")[1];if(i===e)return o}return""}function __readParam(e,a,r,t){var n=e||"",i=a||"",o=r||"",s=t||{},d=__readRMCookiev2(n),u=s[i],m=(d=s.ignoreCookie||!1?0:d)||u||o;return m=("string"!=typeof m||"false"!==m.toLowerCase())&&m}function sRAN(){var e=DataLayer&&DataLayer.Sale&&DataLayer.Sale.Basket?DataLayer.Sale.Basket:{},a=e.affiliateConfig||{},r=__readParam("atm","tagType","pixel",a),t=__readParam("adr","discountType","order",a),n=__readParam("acs","includeStatus","false",a),i=__readParam("arto","removeOrderTax","false",a),o=__readParam("artp","removeTaxFromProducts","false",a),s=__readParam("artd","removeTaxFromDiscount","false",a),d=__readParam("atr","taxRate",0,a);d=Number(d);var u=__readParam("ald","land",!1,{})||(a.land&&!0===a.land?__readRMCookie("ranLandDateTime"):a.land)||!1,m=__readParam("atrv","tr",!1,{})||(a.tr&&!0===a.tr?__readRMCookie("ranSiteID"):a.tr)||!1,l=!1,c=__readParam("amid","ranMID","",a)||e.ranMID;if(!c)return!1;if(!(void 0===a.allowCommission||"false"!==a.allowCommission))return!1;var p=e.orderid||"OrderNumberNotAvailable",f="",y="",_="",v="",N=e.currency||"";N=N.toUpperCase();var h=e.taxAmount?Math.abs(Math.round(100*Number(e.taxAmount))):0,g=e.discountAmount?Math.abs(Math.round(100*Number(e.discountAmount))):0;if(s&&d)var C=(100+Number(d))/100,g=Math.round(g/C);var b="pixel"===r?"ep":"mop"===r?"eventnvppixel":"ep",S=e.customerStatus||"",D=document.location.protocol+"//track.linksynergy.com/"+b+"?",w="";null!=S&&""!=S&&(n&&"EXISTING"==S.toUpperCase()||n&&"RETURNING"==S.toUpperCase())&&(w="R_");for(var P=[],x=0,T=0;T<(e.lineitems?e.lineitems.length:0);T++){for(var R=!1,k=window.JSON?JSON.parse(JSON.stringify(e.lineitems[T])):e.lineitems[T],L=0;L<P.length;L++)P[L].SKU===k.SKU&&(R=!0,P[L].quantity=Number(P[L].quantity)+Number(k.quantity));R||P.push(k),x+=Number(k.quantity)*Number(k.unitPriceLessTax||k.unitPrice)*100}for(T=0;T<P.length;T++){var k=P[T],I=encodeURIComponent(k.SKU),M=k.unitPriceLessTax||k.unitPrice,U=k.quantity,A=encodeURIComponent(k.productName)||"",O=Math.round(Number(M)*Number(U)*100);!o||!d||k.unitPriceLessTax&&k.unitPriceLessTax!==k.unitPrice||(O/=C=(100+d)/100),"item"===t.toLowerCase()&&g&&(O-=g*O/x),f+=w+I+"|",y+=U+"|",_+=Math.round(O)+"|",v+=w+A+"|"}f=f.slice(0,-1),y=y.slice(0,-1),_=_.slice(0,-1),v=v.slice(0,-1),g&&"order"===t.toLowerCase()?(f+="|"+w+"DISCOUNT",v+="|"+w+"DISCOUNT",y+="|0",_+="|-"+g):g&&"item"===t.toLowerCase()&&(l=!0),i&&h&&(f+="|"+w+"ORDERTAX",y+="|0",_+="|-"+h,v+="|"+w+"ORDERTAX"),D+="mid="+c+"&ord="+p+"&skulist="+f+"&qlist="+y+"&amtlist="+_+"&cur="+N+"&namelist="+v+"&img=1&",u&&(D+="land="+u+"&"),m&&(D+="tr="+m+"&"),l&&(D+="discount="+g+"&"),"&"===D[D.length-1]&&(D=D.slice(0,-1));var E,B=document.createElement("img");B.setAttribute("src",D),B.setAttribute("height","1px"),B.setAttribute("width","1px"),(E=document.getElementsByTagName("script")[0]).parentNode.insertBefore(B,E)}function sDisplay(){var e=null,a=null,r=null,t=null,n=window.DataLayer&&window.DataLayer.Sale&&window.DataLayer.Sale.Basket?window.DataLayer.Sale.Basket:{},i=n.displayConfig||{},o=n.customerStatus||"",s=n.discountAmount?Math.abs(Number(n.discountAmount)):0,d=null,u=__readParam("dmid","rdMID","",i);if(!u)return!1;var m=__readParam("dtm","tagType","js",i),l="if"===(m="js"===m||"if"===m||"img"===m?m:"js")?"iframe":"img"===m?m:"script",c="//"+__readParam("ddn","domain","tags.rd.linksynergy.com",i)+"/"+m+"/"+u,p=__readParam("dis","includeStatus","false",i),f="";if(null!=o&&""!=o&&(p&&"EXISTING"==o.toUpperCase()||p&&"RETURNING"==o.toUpperCase())&&(f="R_"),!n.orderid||!n.conversionType)return!1;r=0,a=f+n.orderid,e="",t="conv",d=n.currency;for(var y=0;y<(n.lineitems?n.lineitems.length:0);y++)r+=Number(n.lineitems[y].unitPriceLessTax)*Number(n.lineitems[y].quantity)||Number(n.lineitems[y].unitPrice)*Number(n.lineitems[y].quantity),e+=encodeURIComponent(n.lineitems[y].SKU)+",";r=Math.round(100*(r-s))/100,(e=e.slice(0,-1))&&(c=c.indexOf("?")>-1?c+"&prodID="+e:c+"/?prodID="+e),a&&(c=c.indexOf("?")>-1?c+"&orderNumber="+a:c+"/?orderNumber="+a),r&&(c=c.indexOf("?")>-1?c+"&price="+r:c+"/?price="+r),d&&(c=c.indexOf("?")>-1?c+"&cur="+d:c+"/?cur="+d),t&&(c=c.indexOf("?")>-1?c+"&pt="+t:c+"/?pt="+t);var _=document.createElement(l);_.src=c,"script"===l?_.type="text/javascript":"iframe"===l&&_.setAttribute("style","display: none;"),document.getElementsByTagName("body")[0].appendChild(_)}function sSearch(){var e=window.DataLayer&&window.DataLayer.Sale&&window.DataLayer.Sale.Basket?window.DataLayer.Sale.Basket:{},a=e.searchConfig||{},r=__readParam("smid","rsMID","",a);if(!r)return!1;var t=function(){var t=e.discountAmount?Math.abs(Number(e.discountAmount)):0,n=__readParam("sct","conversionType","conv",a),i=0,o="";if(!e.orderid)return!1;i=0,o=e.orderid;for(var s=0;s<(e.lineitems?e.lineitems.length:0);s++)i+=Number(e.lineitems[s].unitPrice)*Number(e.lineitems[s].quantity);i=Math.round(100*(i-t))/100;window.DataLayer.Sale.Basket;var d=[];d[0]="id="+r,d[1]="type="+n,d[2]="val="+i,d[3]="orderId="+o,d[4]="promoCode="+e.discountCode||"",d[5]="valueCurrency="+e.currency||"USD",d[6]="GCID=",d[7]="kw=",d[8]="product=",k_trackevent(d,"113")},n=document.location.protocol.indexOf("s")>-1?"https://":"http://";n+="113.xg4ken.com/media/getpx.php?cid="+r;var i=document.createElement("script");i.type="text/javascript",i.src=n,i.onload=t,i.onreadystatechange=function(){"complete"!=this.readyState&&"loaded"!=this.readyState||t()},document.getElementsByTagName("head")[0].appendChild(i)}sRAN(),sDisplay(),sSearch();</script> 
-		<!-- END of Rakuten Marketing Conversion Tag -->';
+			$items_array[] = array( 
+				'quantity' => $qty,
+				'unitPrice' => ( $item_total + $item_total_tax ) / $qty,
+				'unitPriceLessTax' => $item_total / $qty,
+				'SKU' => $sku,
+				'productName' => $name,
+			);
+		}
+
+		$rm_trans = array(
+			'affiliateConfig' => array(
+				'ranMID' => $this->ranMID,
+				'discountType' => $this->discountType,
+				'includeStatus' => 'false',
+			),
+			'orderid' => $order_number ?? $order_id,
+			'currency' => $order_cur,
+			'customerStatus' => $order_user_status,
+			'conversionType' => 'Sale',
+			'customerID' => $order_user_id,
+			'discountCode' => $order_coupons,
+			'taxAmount' => $order_tax,
+			'lineitems' => $items_array
+		);
+
+		?>
+		
+		<!-- START Rakuten Advertising Conversion Datalayer -->
+		<script type="text/javascript">
+			/* <![CDATA[ */
+			var rm_trans = <?php echo json_encode( $rm_trans ); ?>;
+			/* ]]> */
+		</script>
+		<script src="<?php echo plugin_dir_url( __FILE__ ) . 'rakuten-datalayer.js'; ?>">
+		<!-- END Rakuten Advertising Conversion Datalayer -->
+		<?php
 	}
 
 }
